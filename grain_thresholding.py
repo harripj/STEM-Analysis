@@ -6,12 +6,13 @@ Created on Fri Aug 31 16:01:51 2018
 @author: pjh523
 """
 
-from scipy import optimize as _optimize, ndimage as _ndi
+from scipy import optimize as _optimize, ndimage as _ndi, signal as _signal
 from skimage import segmentation as _segmentation, measure as _measure, \
-    exposure as _exposure, filters as _filters, feature as _feature, \
-    morphology as _morphology
+                    exposure as _exposure, filters as _filters, \
+                    feature as _feature, morphology as _morphology
 from matplotlib import pyplot as _plt
 import numpy as _np
+from scipy import ndimage as _ndi
 
 import logging as _logging
 from types import FunctionType as _FunctionType
@@ -24,6 +25,60 @@ except ImportError:
     _logging.warning('Some modules have not been loaded.' \
                     + ' Some functions may be unavailable.')
 
+def radial_threshold(image, coords, radii, npts=128):
+    '''
+
+    UNFINISED
+    Perform a radial line profile around each point in coords to establish a threshold.
+
+    Parameters
+    ----------
+    image: numpy.ndarray
+        Image to threshold.
+    coords: numpy.ndarray, shape Nximage.ndim
+        Coordinates of features to threshold.
+    Radii: array-like
+        Radius values to consider.
+    '''
+    # format inputs
+    radii = _np.asarray(radii)
+
+    # full circle
+    theta = _np.linspace(0, 2*_np.pi, npts)
+    
+    # for each coordinate
+    for coord in coords:
+        # do multiple line profiles along radius
+        lp = _np.array([r*_np.array((_np.sin(theta), _np.cos(theta))) + coord[:, _np.newaxis] for r in radii])
+        profiles = _np.split(_ndi.map_coordinates(image, _np.concatenate(lp, axis=1)), radii.size)
+# TODO- work out some kind of threshold with these profiles...
+
+def threshold_otsu_power(image, power=1./10):
+    '''
+
+    Compute Otsu's threshold on power scaled data.
+
+    Parameters
+    ---------
+    image: numpy.ndarray
+        Image to threshold.
+    power: float, default is 1./10
+        Power scaling factor.
+
+    Returns
+    -------
+    threshold: float
+
+    '''
+    # make data copy to ensure array safety
+    image = _np.array(image, dtype=float)
+    offset = image.min()
+    # shift data range to avoid negative numbers
+    image -= offset
+    # compute threshold
+    threshold = _filters.threshold_otsu(_np.power(image, power))
+    # return threshold in original scale
+    return _np.power(threshold, 1./power) + offset
 
 def binary_from_canny(image, radius=10, **kwargs):
     '''
@@ -119,6 +174,56 @@ def threshold_otsu_median(image, nbins=256):
     threshold = bin_centers[:-1][idx]
     return threshold
 
+def _otsu_median_variance(image, nbins=256):
+    '''
+
+    Performs main bulk of calculations for Otsu's median adapted threshold.
+
+    Parameters
+    ----------
+    image: numpy.ndarray
+        Greyscale image.
+    nbins: int, default is 256
+        Number of bins in histogram.
+
+    Returns
+    -------
+    variance: numpy.ndarray, length=nbins-1
+        Calculated intra-class variance
+    bin_centers: numpy.ndarray, length=nbins
+        Histogram bin locations.
+    
+    '''
+    # image needed as float, otherwise median calculations stall
+    image = _np.asarray(image, dtype=float)
+    hist, bin_centers = _exposure.histogram(image, nbins=nbins)
+
+    # class probabilities for all possible thresholds
+    cumulative = _np.cumsum(hist)
+
+    # sort all intensity values
+    vals = _np.sort(image.ravel())
+
+    # make hist float otherwise calculations will fail
+    hist = hist.astype(float)
+    weight1 = cumulative / _np.sum(hist)
+    weight2 = _np.cumsum(hist[::-1])[::-1] / _np.sum(hist) # cumulative sum backwards
+    
+    # class medians for all possible thresholds
+    median1 = _np.array([vals[:cumulative[i]][cumulative[i]//2] for i in range(0, hist.size-1)])
+    median2 = _np.array([vals[cumulative[i-1]:][(vals.size-cumulative[i-1])//2] for i in range(1, hist.size)])
+    
+    # median for whole image
+    medianT = vals[vals.size//2]
+
+    # Clip ends to align class 1 and class 2 variables:
+    # The last value of `weight1`/`mean1` should pair with zero values in
+    # `weight2`/`mean2`, which do not exist.
+    variance12 = weight1[:-1]*(median1-medianT)**2 + weight2[1:]*(median2-medianT)**2
+
+    return variance12, bin_centers
+
+
 def threshold_otsu_median2(image, nbins=256):
     '''Calculates a greyscale image threshold using Otsu's method but using the class median (histogram mode) as the intraclass descriptor.
     This algorithm works especially well for the edges of the image bright features.
@@ -139,36 +244,60 @@ def threshold_otsu_median2(image, nbins=256):
     threshold: float
         The calculated threshold.
     '''
-    # image needed as float, otherwise median calculations stall
-    image = image.astype(float)
-    hist, bin_centers = _exposure.histogram(image, nbins=nbins)
+    # calculate intra-class variance
+    variance, bin_centers = _otsu_median_variance(image, nbins=nbins)
+    # get maximum variance
+    idx = _np.argmax(variance)
+    # return threshold
+    return bin_centers[:-1][idx]
 
-    # class probabilities for all possible thresholds
-    cumulative = _np.cumsum(hist)
+def threshold_low_signal(image, nbins=256, max_iter=10000):
+    '''
 
-    # make hist float otherwise calculations will fail
-    hist = hist.astype(float)
-    weight1 = cumulative / _np.sum(hist)
-    weight2 = _np.cumsum(hist[::-1])[::-1] / _np.sum(hist) # cumulative sum backwards
+    Thresholds an image with low signal, ie. where one feature dominates the intensity histogram.
+    Uses a combined approach of Otsu's median threshold and then minimum thresholding to find the threshold.
 
-    # sort all intensity values
-    vals = _np.sort(image, axis=None)
+    Parameters
+    ----------
+    image: numpy.ndarray
+        Image to threshold.
+    nbins: int, default is 256
+        Number of histogram bins.
+    max_iter: int, default is 10000
+        Maximum number of smoothing steps to perform.
+
+    Returns
+    -------
+    threshold: float
+        Calculated threshold value.
     
-    # class medians for all possible thresholds
-    median1 = _np.array([vals[:cumulative[i]][cumulative[i]//2] for i in range(1, hist.size)])
-    median2 = _np.array([vals[cumulative[i-1]:][(vals.size-cumulative[i-1])//2] for i in range(1, hist.size)])
-    
-    # median for whole image
-    medianT = vals[vals.size//2]
+    '''
+    # calculate intra-class variance
+    variance, bin_centers = _otsu_median_variance(image, nbins=nbins)
 
-    # Clip ends to align class 1 and class 2 variables:
-    # The last value of `weight1`/`mean1` should pair with zero values in
-    # `weight2`/`mean2`, which do not exist.
-    variance12 = weight1[:-1]*(median1-medianT)**2 + weight2[1:]*(median2-medianT)**2
-    
-    idx = _np.argmax(variance12)
-    threshold = bin_centers[:-1][idx]
-    return threshold
+    # basically perfroming skimage.filters.threshold_minimum algorithm
+    # on variance histogram
+    smooth_hist = variance.astype(_np.float, copy=False)
+
+    # minimum algorithm
+    for counter in range(max_iter):
+        smooth_hist = _ndi.uniform_filter1d(smooth_hist, 3)
+        maximum_idxs = _np.squeeze(_signal.argrelextrema(smooth_hist,
+                                                         _np.greater_equal))
+        # looking for two maxima
+        if len(maximum_idxs) < 3:
+            break
+
+    if len(maximum_idxs) != 2:
+        raise RuntimeError('Unable to find two maxima in histogram')
+    elif counter == max_iter - 1:
+        raise RuntimeError('Maximum iteration reached for histogram'
+                           'smoothing')
+
+    # Find lowest point between the maxima
+    threshold_idx = _np.argmin(smooth_hist[maximum_idxs[0]: maximum_idxs[1]+1])
+    # return threshold
+    return bin_centers[:-1][maximum_idxs[0] + threshold_idx]
 
 def revolve_arc(arr, radius=20., axis=(0,1)):
     '''
@@ -320,59 +449,6 @@ def grains_by_hysteresis_threshold(image, nsigma=5, plot=False):
         
     return mask
 
-def measure_and_tidy_up(mask, min_size=6, intensity_image=None, \
-                        pixel_size=None):
-    '''
-    Labels the grain mask, removes grains from border and smaller than min_size,
-    and measures the grain properties.
-    
-    Parameters
-    ----------
-    mask: numpy.ndarray
-        Binary array of grains to measure.
-    min_size: int
-        Minimum size in pixels of smallest grains to measure.
-    intensity_image: numpy.ndarray
-        Associated greyscale image to pass to skimage.measure.regionprops.
-        Default is None.
-    pixel_size: float
-        Real-area value of one pixel in the image.
-        This information is defined as a class attribute of each RegionProps.
-        Default is None.
-        eg. for DM3 data:
-            pixel_size = dm3.pxsize[0] * dm3_functions.DM3_SCALE_DICT[dm3.pxsize[1]]
-        
-    Returns
-    -------
-    labelled: numpy.ndarray
-        Labelled grain mask.
-    rp: list of skimage.measure.regionprops
-        Measured grain properties.
-    '''
-    # remove grains from border
-    mask = _segmentation.clear_border(mask)
-    # label the grains
-    labelled = _measure.label(mask)
-    # calcuate grain properties
-    rp = _measure.regionprops(labelled, intensity_image=intensity_image)
-    
-    # do grain filtering (by pixel area)
-    to_remove = []
-    for grain in rp:
-        # define pixel size in real area for each grain
-        grain.pixel_size = pixel_size
-        if grain.area < min_size:
-            # remove grain from region properties list
-            to_remove.append(grain)
-            # remove grain from mask
-            labelled[labelled==grain.label] = 0
-            
-    # avoid errors due to removing and continuing 2 items down in list
-    for grain in to_remove:
-        rp.remove(grain)
-        
-    return labelled, rp
-
 def binary_segmentation(binary, min_distance=5, markers=None, mask_only=True, use_distance=False):
     '''
     Perform watershed segmentation algorithm, as is described here [1].
@@ -422,7 +498,7 @@ def binary_segmentation(binary, min_distance=5, markers=None, mask_only=True, us
     # maximum as the initial filling points, and label only the original binary mask
     if use_distance:
         # do watershed on edt
-        labels = _morphology.watershed(-distance, markers, mask=binary)
+        labels = _morphology.watershed(_np.negative(distance), markers, mask=binary)
     else:
         # do watershed on flat mask (no gradient descent)
         labels = _morphology.watershed(_np.logical_not(binary), markers, mask=binary)
